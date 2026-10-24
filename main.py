@@ -10,14 +10,31 @@ from openpyxl.utils import get_column_letter
 
 TYPES = ["Плановая", "Неплановая", "Аварийная", "Технологическое нарушение"]
 STATUSES = ["Открыта", "В работе", "Закрыта"]
+DT_FMT = "%d.%m.%Y %H:%M"
+DT_HINT = "ДД.ММ.ГГГГ ЧЧ:ММ, например 14.10.2026 08:30"
+
 FIELDS = [
-    ("date", "Дата"), ("type", "Тип работ"), ("object", "Объект"),
-    ("equipment", "Оборудование"), ("description", "Описание"),
-    ("responsible", "Ответственный"), ("start", "Начало"),
-    ("end", "Окончание"), ("status", "Статус"),
+    ("date", "Дата"),
+    ("type", "Тип работ"),
+    ("object", "Объект"),
+    ("equipment", "Оборудование"),
+    ("description", "Описание"),
+    ("works", "Какие работы выполнены"),
+    ("cause", "Причина отключения"),
+    ("responsible", "Ответственный"),
+    ("opened", "Открытие заявки"),
+    ("closed", "Закрытие заявки"),
+    ("off", "Отключение"),
+    ("on", "Включение"),
+    ("duration", "Длительность отключения, мин"),
+    ("status", "Статус"),
 ]
-WIDTHS = {"date": 90, "type": 170, "object": 130, "equipment": 130, "description": 260,
-          "responsible": 130, "start": 60, "end": 70, "status": 90}
+LABELS = dict(FIELDS)
+INPUT_KEYS = [k for k, _ in FIELDS if k != "duration"]
+DT_KEYS = ("opened", "closed", "off", "on")
+WIDTHS = {"date": 90, "type": 170, "object": 120, "equipment": 120, "description": 240,
+          "works": 200, "cause": 180, "responsible": 120, "opened": 130, "closed": 130,
+          "off": 130, "on": 130, "duration": 150, "status": 90}
 
 
 def data_path():
@@ -32,11 +49,30 @@ def today():
     return datetime.date.today().strftime("%d.%m.%Y")
 
 
+def parse_dt(s):
+    try:
+        return datetime.datetime.strptime(s.strip(), DT_FMT)
+    except (ValueError, AttributeError):
+        return None
+
+
+def minutes_between(off, on):
+    t1, t2 = parse_dt(off), parse_dt(on)
+    if t1 is None or t2 is None:
+        return ""
+    return int((t2 - t1).total_seconds() // 60)
+
+
+def dur(r):
+    v = r.get("duration", "")
+    return v if isinstance(v, int) else 0
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Заявки на работы")
-        self.geometry("1150x680")
+        self.geometry("1280x760")
         self.records = self.load()
         self.build_ui()
         self.refresh()
@@ -56,9 +92,9 @@ class App(tk.Tk):
         form = ttk.LabelFrame(self, text="Новая заявка", padding=10)
         form.pack(fill="x", padx=10, pady=8)
         self.vars = {}
-        for i, (key, label) in enumerate(FIELDS):
+        for i, key in enumerate(INPUT_KEYS):
             r, c = divmod(i, 3)
-            ttk.Label(form, text=label).grid(row=r * 2, column=c, sticky="w", padx=6)
+            ttk.Label(form, text=LABELS[key]).grid(row=r * 2, column=c, sticky="w", padx=6)
             if key == "type":
                 w = ttk.Combobox(form, values=TYPES, state="readonly")
             elif key == "status":
@@ -73,8 +109,11 @@ class App(tk.Tk):
         self.vars["status"].set(STATUSES[0])
         self.clear()
 
+        rows = (len(INPUT_KEYS) + 2) // 3
+        ttk.Label(form, text=f"Формат времени: {DT_HINT}").grid(
+            row=rows * 2, column=0, columnspan=3, sticky="w", padx=6)
         btns = ttk.Frame(form)
-        btns.grid(row=6, column=0, columnspan=3, sticky="e", pady=6)
+        btns.grid(row=rows * 2 + 1, column=0, columnspan=3, sticky="e", pady=6)
         ttk.Button(btns, text="Добавить", command=self.add).pack(side="left", padx=4)
         ttk.Button(btns, text="Очистить поля", command=self.clear).pack(side="left", padx=4)
 
@@ -85,11 +124,20 @@ class App(tk.Tk):
         ttk.Button(bar, text="Выгрузить в Excel", command=self.export).pack(side="right")
 
         cols = [k for k, _ in FIELDS]
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
-        for k, label in FIELDS:
-            self.tree.heading(k, text=label)
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=10, pady=8)
+        self.tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
+        for k, _ in FIELDS:
+            self.tree.heading(k, text=LABELS[k])
             self.tree.column(k, width=WIDTHS[k], anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=10, pady=8)
+        ysb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        xsb = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
 
     def clear(self):
         for w in self.vars.values():
@@ -98,10 +146,19 @@ class App(tk.Tk):
         self.vars["date"].insert(0, today())
 
     def add(self):
-        rec = {k: self.vars[k].get().strip() for k, _ in FIELDS}
+        rec = {k: self.vars[k].get().strip() for k in INPUT_KEYS}
         if not rec["object"] or not rec["description"]:
             messagebox.showwarning("Нет данных", "Заполните поля «Объект» и «Описание».")
             return
+        for k in DT_KEYS:
+            if rec[k] and parse_dt(rec[k]) is None:
+                messagebox.showwarning("Дата и время",
+                                       f"Поле «{LABELS[k]}» заполните в формате:\n{DT_HINT}")
+                return
+        if rec["off"] and rec["on"] and parse_dt(rec["on"]) <= parse_dt(rec["off"]):
+            messagebox.showwarning("Время", "Время включения должно быть позже времени отключения.")
+            return
+        rec["duration"] = minutes_between(rec["off"], rec["on"])
         self.records.append(rec)
         self.save()
         self.refresh()
@@ -154,7 +211,18 @@ class App(tk.Tk):
         headers = ["№"] + [label for _, label in FIELDS]
         ws.append(headers)
         for n, r in enumerate(self.records, 1):
-            ws.append([n] + [r.get(k, "") for k, _ in FIELDS])
+            row = [n]
+            for k, _ in FIELDS:
+                v = r.get(k, "")
+                if k in DT_KEYS:
+                    v = parse_dt(v) or v
+                row.append(v)
+            ws.append(row)
+
+        dt_cols = [headers.index(LABELS[k]) + 1 for k in DT_KEYS]
+        for col in dt_cols:
+            for row in range(2, ws.max_row + 1):
+                ws.cell(row=row, column=col).number_format = "dd.mm.yyyy hh:mm"
 
         thin = Side(style="thin", color="999999")
         border = Border(top=thin, bottom=thin, left=thin, right=thin)
@@ -167,22 +235,28 @@ class App(tk.Tk):
                 cell.border = border
                 if cell.row > 1:
                     cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[1].height = 45
         for col in range(1, len(headers) + 1):
-            ws.column_dimensions[get_column_letter(col)].width = 18
+            ws.column_dimensions[get_column_letter(col)].width = 16
         ws.column_dimensions["A"].width = 6
-        ws.column_dimensions[get_column_letter(headers.index("Описание") + 1)].width = 50
-        ws.freeze_panes = "A2"
+        for k in ("description", "works", "cause"):
+            ws.column_dimensions[get_column_letter(headers.index(LABELS[k]) + 1)].width = 40
+        for col in dt_cols:
+            ws.column_dimensions[get_column_letter(col)].width = 18
+        ws.freeze_panes = "B2"
         ws.auto_filter.ref = ws.dimensions
 
         summary = wb.create_sheet("Сводка")
-        summary.append(["Тип работ", "Количество"])
+        summary.append(["Тип работ", "Количество", "Суммарное отключение, мин"])
         for cell in summary[1]:
             cell.font = Font(bold=True)
         for t in TYPES:
-            summary.append([t, sum(1 for r in self.records if r.get("type") == t)])
-        summary.append(["Всего", len(self.records)])
+            items = [r for r in self.records if r.get("type") == t]
+            summary.append([t, len(items), sum(dur(r) for r in items)])
+        summary.append(["Всего", len(self.records), sum(dur(r) for r in self.records)])
         summary.column_dimensions["A"].width = 30
         summary.column_dimensions["B"].width = 14
+        summary.column_dimensions["C"].width = 26
 
         try:
             wb.save(path)
